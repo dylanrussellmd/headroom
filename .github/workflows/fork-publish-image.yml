@@ -1,0 +1,137 @@
+name: fork · publish image (rp5-deploy)
+
+# Fork-only workflow. Builds the `code-slim-nonroot` variant of the headroom
+# image for linux/arm64 (rp5) + linux/amd64 (fallback / dev), pushes to
+# ghcr.io/dylanrussellmd/headroom, tagged by the rp5-deploy branch SHA + a
+# floating `rp5-deploy` tag. Named `fork-publish-image` so it sorts next to
+# any other .fork* additions and is trivially deletable when this fork
+# retires (see .fork/README.md).
+#
+# Distinct from upstream's `docker.yml` in three ways:
+#   1. Trigger: only on push to `rp5-deploy` (upstream fires on push to main
+#      + on release). No accidental collision on either fork's or upstream's
+#      trigger surface.
+#   2. Target: only `code-slim-nonroot` (upstream builds the full matrix of
+#      root/nonroot x slim/full x code/no-code). Reduces build time + GHCR
+#      storage; matches exactly what rp5 pulls.
+#   3. Namespace: pushes to `ghcr.io/dylanrussellmd/headroom` (upstream
+#      pushes to `ghcr.io/chopratejas/headroom`). No overwrite risk.
+
+on:
+  push:
+    branches: [rp5-deploy]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/headroom
+  BAKE_TARGET: runtime-code-slim-nonroot
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-per-arch:
+    # Per-arch fan-out: build each platform on its own native runner so the
+    # Rust extension compilation doesn't cross-compile under QEMU (which
+    # would ~5x the build time). ubuntu-24.04-arm has been GA since Jan
+    # 2025 and gives us a real aarch64 host — this is what upstream's
+    # docker.yml also does.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the code-slim-nonroot variant for THIS platform only. Bake's
+      # `runtime-code-slim-nonroot` target pins:
+      #   HEADROOM_EXTRAS = "proxy,code"  (FastAPI + tree-sitter)
+      #   RUNTIME_USER    = "nonroot"     (drops root)
+      #   target          = "runtime-slim" (distroless base)
+      # See docker-bake.hcl:81-87.
+      - name: Build and push (${{ matrix.arch }})
+        uses: docker/bake-action@v6
+        with:
+          files: |
+            ./docker-bake.hcl
+          targets: ${{ env.BAKE_TARGET }}
+          push: true
+          set: |
+            ${{ env.BAKE_TARGET }}.platform=${{ matrix.platform }}
+            ${{ env.BAKE_TARGET }}.tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BAKE_TARGET }}-${{ matrix.arch }}-${{ github.sha }}
+            ${{ env.BAKE_TARGET }}.cache-from=type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ env.BAKE_TARGET }}-${{ matrix.arch }}
+            ${{ env.BAKE_TARGET }}.cache-to=type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ env.BAKE_TARGET }}-${{ matrix.arch }},mode=max
+
+  # ─── Manifest merge ───────────────────────────────────────────────────────
+  # After both per-arch builds succeed, publish a multi-arch manifest under
+  # human-readable tags so consumers can pull `code-slim-nonroot` or a
+  # specific SHA without caring about arch. Pi 5 pulls arm64 transparently.
+  publish-manifest:
+    needs: build-per-arch
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assemble multi-arch manifests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TARGET: ${{ env.BAKE_TARGET }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${SHA:0:12}"
+          # Two tags per merged manifest:
+          #   1. Immutable: <target>-<full-sha>. Reproducible pinning for Ansible.
+          #   2. Floating:  <target> (== code-slim-nonroot). Convenience.
+          #   3. Floating:  rp5-deploy. Points at HEAD of the deployment branch.
+          for TAG in "${TARGET}-${SHA}" "${TARGET}-${SHORT_SHA}" "${TARGET}" "rp5-deploy"; do
+            echo "==> Creating manifest ${IMAGE}:${TAG}"
+            docker buildx imagetools create \
+              --tag "${IMAGE}:${TAG}" \
+              "${IMAGE}:${TARGET}-amd64-${SHA}" \
+              "${IMAGE}:${TARGET}-arm64-${SHA}"
+          done
+
+      - name: Print image digest for pinning
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TARGET: ${{ env.BAKE_TARGET }}
+        run: |
+          set -euo pipefail
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${TARGET}" --raw \
+            | sha256sum | awk '{print "sha256:" $1}')
+          echo ""
+          echo "Published multi-arch image:"
+          echo "  ${IMAGE}:${TARGET}"
+          echo ""
+          echo "For reproducible Ansible pinning, use the immutable SHA tag:"
+          echo "  ${IMAGE}:${TARGET}-${GITHUB_SHA}"
+          echo ""
+          echo "Or pin by manifest digest (query with: docker buildx imagetools inspect ${IMAGE}:${TARGET})"
